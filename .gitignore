@@ -57,7 +57,6 @@ dlgr/griduniverse/dallinger_develop
 
 docs/build/*
 dlgr/griduniverse/dump.rdb
-dlgr/griduniverse/config.txt
 
 # Editor config, etc.
 .vscode/

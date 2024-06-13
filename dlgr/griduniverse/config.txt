@@ -1,0 +1,44 @@
+[Experiment Configuration]
+mode = sandbox
+network = FullyConnected
+num_rounds = 5
+block_size = 25
+columns = 15
+rows = 15
+window_rows = 15
+window_columns = 15
+use_identicons = true
+show_chatroom = false
+background_animation = false
+duration = 1
+auto_recruit = false
+
+[Collab]
+max_participants = 1
+goal_items = 3
+num_cook = 2
+cook_time = 5
+game_over_cond = cooking
+game_over_item = pie
+motion_auto = false
+
+[Database]
+database_url = postgresql://dallinger:dallinger@localhost/dallinger
+database_size = standard-0
+
+[Server]
+dyno_type = standard-2x
+num_dynos_web = 1
+num_dynos_worker = 1
+host = 0.0.0.0
+clock_on = false
+logfile = -
+
+[Prolific]
+recruiter = prolific
+title = Play a pie-baking game!
+description = You will be asked to play 5 rounds of a simple game, where you collect apples and bake them into pies. 
+prolific_api_token = 8e0iYruKm6orN9ZjkiW5wSmcQdMLhx7TNeo9G3-kGY9LiXa5yR3h_QCiey8RwhXuNCFSx84iYsFVJH8-UKCtlCJ8sSHQV7qzuMKcP0_JS4SJhTY8-j2Ws1cc
+prolific_estimated_completion_minutes = 8
+prolific_recruitment_config = file:prolific_config.json
+base_payment = 1.60
