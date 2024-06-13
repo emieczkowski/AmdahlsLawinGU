@@ -12,6 +12,7 @@ import string
 import time
 import uuid
 from dataclasses import dataclass, field
+import threading
 
 import dallinger
 import flask
@@ -110,6 +111,11 @@ GU_PARAMS = {
     "donation_multiplier": float,
     "num_recruits": int,
     "state_interval": float,
+    "goal_items": int,
+    "game_over_cond": unicode,
+    "num_cook": int,
+    "cook_time": int,
+    "game_over_item": unicode
 }
 
 DEFAULT_ITEM_CONFIG = {
@@ -278,11 +284,25 @@ class Gridworld(object):
         )
         self.leach_survey = kwargs.get("leach_survey", False)
 
+        # Amdahl parameters
+        self.goal_items = kwargs.get("goal_items", 100)
+        self.num_cook = kwargs.get("num_cook", 1)
+        self.cook_time = kwargs.get("cook_time", 0)
+        self.game_over_cond = kwargs.get("game_over_cond", "time")
+        self.game_over_item = kwargs.get("game_over_item", "pie")
+
         # Set some variables.
         self.players = {}
         self.item_locations = {}
         self.items_consumed = []
+        self.items_cooked = []
+        self.items_dropped = set()
+        self.items_cooking = set()
+        self.oven_in_use = False
+        self.oven_time_left = 0
+        self.oven_done = False
         self.start_timestamp = kwargs.get("start_timestamp", None)
+        self.lock = threading.Lock() # locking used for cook threading
 
         self.round = 0
 
@@ -378,6 +398,11 @@ class Gridworld(object):
         raw_remaining = self.time_per_round - self.elapsed_round_time
 
         return max(0, raw_remaining)
+    
+    @property 
+    def remaining_items_to_cook(self):
+        items_remaining = self.goal_items - len(self.items_dropped)
+        return max(0, items_remaining)
 
     @property
     def group_donation_enabled(self):
@@ -440,8 +465,48 @@ class Gridworld(object):
         if not self.game_started:
             return
 
-        if not self.remaining_round_time:
-            self.round += 1
+        if self.game_over_cond == "time":
+            if not self.remaining_round_time:
+                self.round += 1
+                if self.game_over:
+                    return
+                return True
+
+        elif self.game_over_cond == "cooking":
+            if not self.remaining_items_to_cook:
+                self.round += 1
+
+                if self.game_over:
+                    return
+                return True
+        return False
+    
+    def init_round_completion(self, items):
+        if not self.game_started:
+            return
+
+        if self.game_over_cond == "time":
+            self.start_timestamp = time.time()
+            # Delay round for leaderboard display
+            if self.leaderboard_individual or self.leaderboard_group:
+                self.start_timestamp += self.leaderboard_time
+            for player in self.players.values():
+                player.motion_timestamp = 0
+
+        elif self.game_over_cond == "cooking":
+            self.item_locations = {}
+            self.items_consumed = []
+            self.items_cooked = []
+            self.items_dropped = set()
+            self.items_cooking = set()
+            self.oven_in_use = False
+            self.oven_time_left = 0
+
+            # Re-spawn items
+            for item_type in items.values():
+                for _ in range(item_type["item_count"]):
+                    self.spawn_item(item_id=item_type["item_id"])
+
             if self.game_over:
                 return
 
@@ -597,13 +662,213 @@ class Gridworld(object):
                 obj = Item(item_props, **item_params)
                 self.item_locations[tuple(obj.position)] = obj
 
+    # def instructions(self):
+    #     instructions_file_path = os.path.join(
+    #         os.path.dirname(__file__), "templates/instructions/instruct-ready.html"
+    #     )
+    #     with open(instructions_file_path) as instructions_file:
+    #         instructions_html = instructions_file.read()
+    #         return instructions_html
+                
     def instructions(self):
-        instructions_file_path = os.path.join(
-            os.path.dirname(__file__), "templates/instructions/instruct-ready.html"
+        color_costs = ""
+        order = ""
+        text = """"""
+        if self.window_columns < self.columns or self.window_rows < self.rows:
+            text += """ The grid is viewed through a
+                {g.window_columns} x {g.window_rows} window
+                that moves along with your player."""
+        if self.walls_density > 0:
+            text += """ There are walls throughout the grid, which the players
+               cannot pass through."""
+            if not self.walls_visible:
+                text += " However, the walls are not visible."
+        if self.build_walls:
+            text += """ Players can build walls at their current position using
+                the 'w' key. The wall will not appear until the player has moved
+                away from that position."""
+            if self.wall_building_cost > 0:
+                text += """ Building a wall has a cost of {g.wall_building_cost}
+                    points."""
+        if self.num_rounds > 1:
+            text += """ There will be {g.num_rounds} rounds.</p>"""
+        if self.num_players > 1:
+            text += """<p>There are <strong>{g.num_players} players</strong> in this game. All of you will work as a <strong>team</strong> to complete your goal."""
+            if not self.others_visible:
+                text += """ However, players cannot see each other on the
+                    grid."""
+            if self.num_colors > 1:
+                text += """ Each player will be one of {g.num_colors} available
+                    colors ({color_list})."""
+                if self.mutable_colors:
+                    text += " Players can change color using the 'c' key."
+                    if self.costly_colors:
+                        costs = [
+                            "{c}, {p} points".format(c=c, p=p)
+                            for p, c in zip(
+                                self.color_costs, self.limited_player_color_names
+                            )
+                        ]
+                        color_costs = "; ".join(costs)
+                        text += """ Changing color has a different cost in
+                            points for each color: {color_costs}."""
+                if self.contagion > 0:
+                    text += """ If a player enters a region of the grid where a
+                    plurality of the surrounding players within {g.contagion}
+                        blocks are of a different color, that player will take
+                        on the color of the plurality."""
+                    if self.contagion_hierarchy:
+                        order = ", ".join(
+                            [
+                                self.limited_player_color_names[h]
+                                for h in self.contagion_hierarchy
+                            ]
+                        )
+                        text += """ However, there is a hierarchy of colors, so
+                            that only players of some colors are susceptible to
+                            changing color in  this way. The hierarchy, from
+                            lowest to highest, is: {order}. Colors lower in the
+                            hierarchy can be affected only by higher colors."""
+                    if self.frequency_dependence > 0:
+                        text += """ Players will get more points if their
+                            color is in the majority."""
+                    if self.frequency_dependence < 0:
+                        text += """ Players will get more points if their
+                            color is in the minority."""
+        if self.game_over_cond == "time":
+            text += (
+                 " The game duration is <strong>{g.time_per_round}</strong> seconds.</p>"
+            )
+        elif self.game_over_cond == "foraging":
+            text += (
+                "<p><strong>The game will end when you've collected all " + str(self.goal_items) + 
+                "apples and dropped them in the bucket.</strong></p>"
+            )
+        elif self.game_over_cond == "cooking":
+            if self.num_players == 1:
+                text += (
+                    """<p>The objective of this game is to <strong>bake {g.goal_items} 
+                    pies as quickly as possible</strong>. The faster you complete the task, the higher your bonus 
+                    will be.</p>"""
+                )     
+            else:
+                text += (
+                    """<p>The objective of this game is to <strong>bake {g.goal_items} 
+                    pies as quickly as possible</strong>. The faster you complete the task, the higher your bonus 
+                    will be (split evenly between all players at the end of the experiment).</p>"""
+                )  
+        text += """</p><p>The game is played on a {g.columns} x {g.rows} grid, where each player occupies one block at a time. 
+                <br><img src='static/images/cooking.gif'><p>
+                Players move around the grid using the arrow keys.
+                <br><img src='static/images/keys.gif' height='60'><br>
+                """
+        if self.player_overlap:
+            text += " More than one player can occupy a block at the same time."
+        else:
+            if self.num_players > 1:
+                text += """ A player cannot occupy a block where a player is
+                        already present."""
+        if self.visibility < max(self.rows, self.columns):
+            text += """ Players cannot see the whole grid, but only an area
+                approximately {g.visibility} blocks around their current
+                position."""
+        # text += """<p>Press the 'h' key to toggle highlighting of your player.
+        #         <br><img src='static/images/h-toggle.gif' height='150'><p>"""
+        if self.motion_auto:
+            text += """ Once a player presses a key to move, the player will
+                continue to move in the same direction automatically until
+                another key is pressed."""
+        if self.motion_cost > 0:
+            text += """ Each movement costs the player {g.motion_cost}
+                        {g.motion_cost:plural, point, points}."""
+        if self.motion_tremble_rate > 0 and self.motion_tremble_rate < 0.4:
+            text += """ Some of the time, movement will not be in the chosen
+                direction, but random."""
+        if self.motion_tremble_rate >= 0.4 and self.motion_tremble_rate < 0.7:
+            text += """ Movement will not be in the chosen direction most of the
+                time, but random."""
+        if self.motion_tremble_rate >= 0.7:
+            text += """ Movement commands will be ignored almost all of the time,
+                and the player will move in a random direction instead."""
+        if self.game_over_cond == "time":
+            text += """</p><p>Players gain points by getting to squares that have
+                food on them. Each piece of food is worth x
+                points. When the game starts there
+                are <strong>n</strong> pieces
+                of food on the grid. Food is represented by a green"""
+
+            text += " or brown"
+            text += " square: <img src='static/images/food-green.png' height='20'>"
+            text += " <img src='static/images/food-brown.png' height='20'>"
+            text += "<br>Food can be respawned after it is consumed."
+
+            text += """It will appear immediately, but may not be consumable for
+                some time if it has a maturation period. It will show
+                up as brown initially, and then as green when it matures."""
+            text += """<br>The location where the food will appear after respawning is
+                is determined by the <strong>configured</strong>
+                probability distribution for each item type."""
+            text += " Players may be able to plant more food by pressing the spacebar."
+            text += "</p>"
+        if self.game_over_cond == "cooking":
+            text += """</p><p>Players can pick up one apple at a time from the grid by hovering over the apple and pressing the spacebar. 
+                Players can similarly place apples in the oven by hovering over the oven and pressing the spacebar. 
+                <br><img src='static/images/spacebar.gif' style="width: 50%;"><p>
+                When there are {g.num_cook} apples in the oven, the pie will begin to bake. At the top, you will see whether the oven
+                is still available, if it is baking a pie, or if the pie is ready. While the pie is
+                baking, no more apples can be placed inside the oven. At the end of the timer, players will 
+                see a pie in the oven. Players can take the pie out of the oven using the spacebar, 
+                and drop the pie on the ground using the ‘d’ key. Any player can place apples in or take a pie out of the oven."""
+            text += "</p><p>"
+            if self.num_players > 1:
+                text += "Players should work as a team to accomplish their goal. The game is complete when {g.goal_items} pies have been placed anywhere on the grid."
+            else:
+                 text += "The game is complete when {g.goal_items} pies have been placed anywhere on the grid."
+            text += "</p>"   
+        if self.alternate_consumption_donation and self.num_rounds > 1:
+            text += """<p> Rounds will alternate between <strong>consumption</strong> and
+            <strong>donation</strong> rounds. Consumption rounds will allow for free movement
+            on the grid. Donation rounds will disable movement and allow you to donate points.</p>
+            """
+        if self.donation_amount > 0:
+            text += """<img src='static/images/donate-click.gif' height='210'><br>
+            <p>It can be helpful to donate points to others.
+            """
+            if self.donation_individual:
+                text += """ You can donate <strong>{g.donation_amount}</strong>
+                {g.donation_amount:plural, point, points} to any player by clicking on
+                <img src='static/images/donate-individual.png' class='donate'
+                height='30'>, then clicking on their block on the grid.
+                """
+            if self.donation_group:
+                text += """ To donate to a group, click on the
+                <img src='static/images/donate-group.png' class='donate' height='30'>
+                button, then click on any player with the color of the team
+                you want to donate to.
+                """
+            if self.donation_public:
+                text += """ The <img src='static/images/donate-public.png'
+                class='donate' height='30'> button splits your donation amongst
+                every player in the game (including yourself).
+                """
+            text += "</p>"
+        if self.show_chatroom:
+            text += """<p>A chatroom is available to send messages to the other
+                players."""
+            if self.pseudonyms:
+                text += """ Player names shown on the chat window are pseudonyms.
+                        <br><img src='static/images/chatroom.gif' height='150'>"""
+            text += "</p>"
+        if self.dollars_per_point > 0:
+            text += """<p>You will receive <strong>${g.dollars_per_point}</strong> for each point
+                that you score at the end of the game.</p>"""
+        return formatter.format(
+            text,
+            g=self,
+            order=order,
+            color_costs=color_costs,
+            color_list=", ".join(self.limited_player_color_names),
         )
-        with open(instructions_file_path) as instructions_file:
-            instructions_html = instructions_file.read()
-            return instructions_html
 
     def consume(self):
         """Players consume the non-interactive items"""
@@ -639,6 +904,30 @@ class Gridworld(object):
             for player_to in self.players.values():
                 player_to.score += item.public_good * consumed
 
+    def cook(self, playeritem, callback=None, position=None):
+        """Players need to put self.num_cook items in the oven to make 1 new food.
+        The oven takes cook_time seconds to finish."""
+        with self.lock:  # assuming self.lock is a threading.Lock() initialized in __init__
+            if position in self.item_locations:
+                item = self.item_locations[position]
+                if item.item_id == "oven" and not self.oven_in_use:
+                    self.items_cooking.add(playeritem)
+                    if len(self.items_cooking) == self.num_cook:
+                        self.oven_in_use = True
+                        # threading.Thread(target=self.start_cooking, args=(callback, position)).start()
+                        timer = threading.Timer(self.cook_time, self.finish_cooking, [callback, position])
+                        timer.start()
+    
+    def finish_cooking(self, callback, position):
+        """Complete the cooking process after the delay."""
+        with self.lock:
+            if callback:
+                callback(position)
+            if position in self.item_locations:  # Check if the oven is still there
+                self.items_cooked.append(self.item_locations[position])
+            self.items_cooking.clear()  # Reset the items being cooked
+            self.oven_in_use = False
+
     def spawn_item(self, position=None, item_id=None):
         """Respawn an item for a single position"""
         if not item_id:
@@ -667,6 +956,7 @@ class Gridworld(object):
             {
                 "type": "spawn item",
                 "position": position,
+                "item": new_item.id,
             }
         )
 
@@ -780,6 +1070,15 @@ class Gridworld(object):
         )
         self.players[id] = player
         self._start_if_ready()
+
+        self.log_event(
+            {
+                "type": "spawn_player",
+                "player": player.id,
+                "position": player.position,
+            }
+        )
+
         return player
 
     def _find_empty_position(self, item_id=None, player=False):
@@ -1435,6 +1734,16 @@ class Griduniverse(Experiment):
         player = self.grid.players[msg["player_id"]]
         try:
             msgs = player.move(msg["move"], timestamp=msg.get("timestamp"))
+
+            log_data = {
+                'type': 'move',
+                'player_id': player.id,
+                'direction': msg["move"],
+                'time': msg.get("timestamp"),
+                'position': player.position,
+            }
+            self.record_event(log_data)
+
         except IllegalMove:
             error_msg = {
                 "type": "move_rejection",
@@ -1556,6 +1865,26 @@ class Griduniverse(Experiment):
         player.current_item = location_item
         self.grid.items_updated = True
 
+        log_data = {
+            'type': 'item_pick_up',
+            'player_id': player.id,
+            'item_id': player.current_item.item_id,
+            'position': player.position,
+        }
+
+        self.record_event(log_data)
+
+    def cooking_complete_callback(self, position):
+        """Callback function to be called when cooking is completed (threading)."""
+        new_oven = Item(
+                id=len(self.grid.item_locations) + len(self.grid.items_consumed),
+                position=position,
+                item_config=self.item_config["oven_with_pie"],
+            )
+        self.grid.oven_done = True
+        self.grid.item_locations[position] = new_oven
+        self.grid.items_updated = True
+
     def handle_item_transition(self, msg):
         player = self.grid.players[msg["player_id"]]
         player_item = player.current_item
@@ -1575,11 +1904,7 @@ class Griduniverse(Experiment):
         if transition is None:
             transition = self.transition_config.get(transition_key)
 
-        required_actors = transition and transition.get("required_actors", 0)
-        neighbors = player.neighbors()
-        if (transition is None) or (
-            required_actors and len(neighbors) + 1 < required_actors
-        ):
+        if transition is None:
             error_msg = {
                 "type": "action_error",
                 "player_id": player.id,
@@ -1589,59 +1914,70 @@ class Griduniverse(Experiment):
             }
             self.publish(error_msg)
             return
+        
+        # The item is being put in the oven
+        if transition["target_start"] == "oven":
+            if not self.grid.oven_in_use:
+                position = tuple(msg["position"])
+                cook_thread = threading.Thread(target=self.grid.cook, args=(player_item.id, self.cooking_complete_callback, position))
+                cook_thread.start()
+                player.current_item = None
 
-        # these values may be positive or negative, so we may add or remove uses
-        modify_actor_uses, modify_target_uses = transition.get("modify_uses", (0, 0))
-        if player_item and player_item.remaining_uses:
-            player_item.remaining_uses += modify_actor_uses
-        if location_item and location_item.remaining_uses:
-            location_item.remaining_uses += modify_target_uses
+        else:
+            if transition["target_start"] == "oven_with_pie":
+                self.grid.oven_done = False
 
-        # An item that is replaced or has no remaining uses has been "consumed"
-        if player_item and (
-            (player_item.remaining_uses < 1) or transition["actor_end"] != actor_key
-        ):
-            self.grid.items_consumed.append(player_item)
-            player.current_item = None
-            self.grid.items_updated = True
-        if location_item and (
-            (location_item.remaining_uses < 1) or transition["target_end"] != target_key
-        ):
-            del self.grid.item_locations[position]
-            self.grid.items_consumed.append(location_item)
-            self.grid.items_updated = True
+            # these values may be positive or negative, so we may add or remove uses
+            modify_actor_uses, modify_target_uses = transition.get("modify_uses", (0, 0))
+            if player_item and player_item.remaining_uses:
+                player_item.remaining_uses += modify_actor_uses
+            if location_item and location_item.remaining_uses:
+                location_item.remaining_uses += modify_target_uses
 
-        # The player's item type has changed
-        if transition["actor_end"] != actor_key:
-            if transition["actor_end"] is not None:
-                replacement_item_config = self.item_config.get(transition["actor_end"])
-                replacement_item = Item(
+            # An item that is replaced or has no remaining uses has been "consumed"
+            if player_item and (
+                (player_item.remaining_uses < 1) or transition["actor_end"] != actor_key
+            ):
+                self.grid.items_consumed.append(player_item)
+                player.current_item = None
+                self.grid.items_updated = True
+            if location_item and (
+                (location_item.remaining_uses < 1) or transition["target_end"] != target_key
+            ):
+                del self.grid.item_locations[position]
+                self.grid.items_consumed.append(location_item)
+                self.grid.items_updated = True
+
+            # The player's item type has changed
+            if transition["actor_end"] != actor_key:
+                new_player_item = Item(
                     id=len(self.grid.item_locations) + len(self.grid.items_consumed),
-                    item_config=replacement_item_config,
+                    item_config=self.item_config[transition["actor_end"]],
                 )
-            else:
-                replacement_item = None
-            player.current_item = replacement_item
-            self.grid.items_updated = True
+                player.current_item = new_player_item
+                self.grid.items_updated = True
 
-        # The location's item type has changed
-        if transition["target_end"] != target_key:
-            new_target_item = Item(
-                id=len(self.grid.item_locations) + len(self.grid.items_consumed),
-                position=position,
-                item_config=self.item_config[transition["target_end"]],
-            )
-            self.grid.item_locations[position] = new_target_item
-            self.grid.items_updated = True
+            # The location's item type has changed
+            if transition["target_end"] != target_key:
+                new_target_item = Item(
+                    id=len(self.grid.item_locations) + len(self.grid.items_consumed),
+                    position=position,
+                    item_config=self.item_config[transition["target_end"]],
+                )
+                self.grid.item_locations[position] = new_target_item
+                self.grid.items_updated = True   
+        
+        log_data = {
+            'type': 'item_transition',
+            'player_id': player.id,
+            'actor_start': transition["actor_start"],
+            'actor_end': transition["actor_end"],
+            'target_start': transition["target_start"],
+            "target_end": transition["target_end"],
+            'position': player.position,
+        }
 
-        # Possibly distribute calories to participating players
-        transition_calories = transition.get("calories")
-        if transition_calories:
-            per_player = transition_calories // (len(neighbors) + 1)
-            for other_player in neighbors:
-                other_player.score += per_player
-            player.score += per_player
-            player.score += transition_calories % (len(neighbors) + 1)
+        self.record_event(log_data)
 
     def handle_item_drop(self, msg):
         player = self.grid.players[msg["player_id"]]
@@ -1662,6 +1998,18 @@ class Griduniverse(Experiment):
         self.grid.item_locations[position] = player_item
         player.current_item = None
         self.grid.items_updated = True
+
+        if player_item.item_id == self.grid.game_over_item:
+            self.grid.items_dropped.add(player_item.creation_timestamp) 
+
+        log_data = {
+            'type': 'item_drop',
+            'player_id': player.id,
+            'item': player_item.item_id,
+            'position': player.position,
+        }
+
+        self.record_event(log_data)
 
     def send_state_thread(self):
         """Publish the current state of the grid and game"""
@@ -1713,6 +2061,35 @@ class Griduniverse(Experiment):
                 "remaining_time": self.grid.remaining_round_time,
                 "round": self.grid.round,
             }
+
+            if self.grid.game_over_cond == "time":
+                message = {
+                    "type": "state",
+                    "grid": json.dumps(grid_state),
+                    "count": count,
+                    "remaining_time": self.grid.remaining_round_time,
+                    "round": self.grid.round,
+                }
+            elif self.grid.game_over_cond == "foraging":
+                message = {
+                    "type": "state",
+                    "grid": json.dumps(grid_state),
+                    "count": count,
+                    "remaining_time": self.grid.goal_items - len(self.grid.items_consumed),
+                    "round": self.grid.round,
+                }
+
+            elif self.grid.game_over_cond == "cooking":
+                message = {
+                    "type": "state",
+                    "grid": json.dumps(grid_state),
+                    "count": count,
+                    "remaining_time": len(self.grid.items_cooked),
+                    "oven_time_left": self.grid.oven_time_left,
+                    "oven_in_use": self.grid.oven_in_use,
+                    "oven_done": self.grid.oven_done,
+                    "round": self.grid.round,
+                }
 
             self.publish(message)
             if self.grid.game_over:
@@ -1808,8 +2185,13 @@ class Griduniverse(Experiment):
 
             self.grid.compute_payoffs()
             game_round = self.grid.round
-            self.grid.check_round_completion()
-            if self.grid.round != game_round and not self.grid.game_over:
+
+            newround = self.grid.check_round_completion()
+
+            # if self.grid.round != game_round and not self.grid.game_over:
+            if newround and not self.grid.game_over:
+                self.configure()
+                self.grid.init_round_completion(self.item_config)
                 self.publish({"type": "new_round", "round": self.grid.round})
                 self.record_event({"type": "new_round", "round": self.grid.round})
 

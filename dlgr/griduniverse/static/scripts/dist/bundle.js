@@ -22263,6 +22263,7 @@ var require;/*global dallinger, store */
         "#individual-donate, #group-donate, #public-donate, #ingroup-donate",
       ),
       $timeElement = $("#time"),
+      $ovenTimeElement = $("#oven-time"),
       $loading = $(".grid-loading"),
       cur_wall,
       ego,
@@ -22280,6 +22281,10 @@ var require;/*global dallinger, store */
 
     // Update remaining time.
     $timeElement.html(Math.max(Math.round(msg.remaining_time), 0));
+
+    // Update oven time.
+    if (msg.oven_in_use) $ovenTimeElement.html('Your pie is baking');
+    else $ovenTimeElement.html('Oven not in use');
 
     // Update round.
     if (settings.num_rounds > 1) {
