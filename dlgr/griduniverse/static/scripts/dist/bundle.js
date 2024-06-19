@@ -22460,6 +22460,7 @@ var require;/*global dallinger, store */
         $("#dashboard").hide();
         $("#instructions").hide();
         $("#chat").hide();
+        console.log(player_id)
         if (player_id) {
           window.location.href = "/questionnaire?participant_id=" + player_id;
         }

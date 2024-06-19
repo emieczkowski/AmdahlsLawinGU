@@ -182,7 +182,7 @@ items:
     item_id: apple
     portable: true
     spawn_rate: 0
-    item_count: 6
+    item_count: 10
     sprite: "emoji:🍎"
 
   - crossable: true
